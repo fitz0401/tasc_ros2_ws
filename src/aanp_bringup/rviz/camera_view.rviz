@@ -1,0 +1,14 @@
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Image
+      Name: Color Image
+      Topic: /L515/color/image_raw
+    - Class: rviz_default_plugins/PointCloud2
+      Name: PointCloud
+      Topic: /L515/depth/color/points
+      Queue Size: 10
+  Global Options:
+    Fixed Frame: L515_link
+  Tools: []
+  Enabled: true

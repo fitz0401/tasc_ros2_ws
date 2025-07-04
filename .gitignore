@@ -1,0 +1,8 @@
+build/
+install/
+log/
+*.pyc
+__pycache__/
+.env
+*.swp
+src/realsense-ros/
