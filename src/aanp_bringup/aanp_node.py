@@ -57,19 +57,20 @@ class AANPMain(Node):
         if not self.got_frame:
             self.got_frame = True
             self.get_logger().info("Received first frame: PointCloud and Image. Starting AANP logic...")
+            # Send the latest pointcloud and image to the WebSocket server once
+            # ...
         self.latest_pointcloud = pointcloud_msg
         self.latest_image = image_msg
-        # Image process logic would go here
-        # ...
     
     def joy_callback(self, msg):
         self.joy_listener.update_from_joy_msg(msg)
-        
-        # Gripper控制
+        # Gripper control
         if msg.buttons[0]:  # A：close gripper
             self.send_gripper_command(0.0, 20.0)
         elif msg.buttons[1]:  # B：open gripper
             self.send_gripper_command(0.039, 20.0)
+        # Send the gripper command to the WebSocket server
+        # ...
 
     def twist_timer_callback(self):
         if not self.got_frame:
@@ -80,12 +81,13 @@ class AANPMain(Node):
         if not eef_pose:
             self.get_logger().warn("EEF pose not available, skipping twist command.")
             return
-        
-        # Main AANP logic would go here
-        # ...
+
+        # # Teleoperation Controller
+        vel_x, vel_y, vel_z, vel_roll, vel_pitch, vel_yaw = self.teleop_controller(eef_pose)
+
         # Shared Controller
-        vel_x, vel_y, vel_z, vel_roll, vel_pitch, vel_yaw = self.shared_controller(eef_pose)
-        
+        # vel_x, vel_y, vel_z, vel_roll, vel_pitch, vel_yaw = self.shared_controller(eef_pose)
+
         # Send twist command
         twist = TwistStamped()
         twist.header.stamp = self.get_clock().now().to_msg()
@@ -130,14 +132,22 @@ class AANPMain(Node):
             self.get_logger().warn(f"Can not get EEF pose: {e}")
             return None
 
-    def shared_controller(self, eef_pose):
+    def teleop_controller(self, eef_pose):
         twist_msg = self.joy_listener.get_twist(self.get_clock().now().to_msg())
-        
         if twist_msg is None:
             return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-        
         return twist_msg.twist.linear.x, twist_msg.twist.linear.y, twist_msg.twist.linear.z, \
                twist_msg.twist.angular.x, twist_msg.twist.angular.y, twist_msg.twist.angular.z
+    
+    def shared_controller(self, eef_pose):
+        twist_msg = self.joy_listener.get_twist(self.get_clock().now().to_msg())
+        # Send the twist info to the WebSocket server
+        # ...
+
+        # Receive the assist action from the WebSocket server
+        # ...
+
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     def start_servo_service(self):
         if self.servo_start_client.service_is_ready():
