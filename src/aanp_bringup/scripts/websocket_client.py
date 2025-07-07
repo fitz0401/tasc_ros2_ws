@@ -312,6 +312,44 @@ async def test_rgb_and_points(uri="ws://localhost:8765"):
         print(f"✗ Error testing RGB and points: {e}")
         return False
 
+async def test_assist_action(uri="ws://localhost:8765"):
+    """Test sending assist action to robot"""
+    print("\n=== Testing Assist Action Sending ===")
+    
+    try:
+        async with websockets.connect(uri, max_size=10 * 1024 * 1024) as websocket:
+            print("✓ Connected for assist action test")
+            
+            # Send a small, safe assistance action
+            assist_action = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            
+            request = {
+                "type": "assist_action",
+                "assist_action": assist_action,
+                "gripper_action": None
+            }
+            
+            await websocket.send(json.dumps(request))
+            print(f"✓ Sent safe assist action: {assist_action}")
+            
+            # Wait a moment for the action to be processed
+            await asyncio.sleep(1.0)
+            
+            # Send a neutral action to stop any movement
+            neutral_action = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            neutral_request = {
+                "type": "assist_action", 
+                "assist_action": neutral_action
+            }
+            await websocket.send(json.dumps(neutral_request))
+            print("✓ Sent neutral action to stop movement")
+            
+            return True
+            
+    except Exception as e:
+        print(f"✗ Error testing assist action: {e}")
+        return False
+
 async def test_continuous_data(uri="ws://localhost:8765", duration=10):
     """Test continuous EEF pose and gripper action reception"""
     print(f"\n=== Testing Continuous Data Reception for {duration} seconds ===")
@@ -378,8 +416,19 @@ async def run_all_tests(server_uri="ws://localhost:8765"):
     print("\nTest 2: RGB and Point Cloud Data")
     rgb_points_result = await test_rgb_and_points(server_uri)
     
-    # Test 3: Continuous data monitoring
-    print("\nTest 3: Continuous Data Monitoring")
+    # Test 3: Assist action sending (optional for safety)
+    assist_result = True  # Default to pass if not tested
+    print("\nTest 3: Assist Action Sending")
+    print("⚠️  WARNING: This will send a small movement command to the real robot!")
+    user_confirm = input("Do you want to proceed? (y/N): ").lower().strip()
+    if user_confirm == 'y' or user_confirm == 'yes':
+        assist_result = await test_assist_action(server_uri)
+    else:
+        print("❌ Assist action test skipped by user")
+        assist_result = False
+    
+    # Test 4: Continuous data monitoring
+    print("\nTest 4: Continuous Data Monitoring")
     continuous_result = await test_continuous_data(server_uri, duration=5)  # 5 seconds for demo
     
     # Summary
@@ -387,9 +436,10 @@ async def run_all_tests(server_uri="ws://localhost:8765"):
     print("📊 Test Results Summary:")
     print(f"  Connectivity: {'✓ PASS' if connectivity_result else '✗ FAIL'}")
     print(f"  RGB & Points: {'✓ PASS' if rgb_points_result else '✗ FAIL'}")
+    print(f"  Assist Action: {'✓ PASS' if assist_result else '✗ FAIL'}")
     print(f"  Continuous:   {'✓ PASS' if continuous_result else '✗ FAIL'}")
     
-    if all([connectivity_result, rgb_points_result, continuous_result]):
+    if all([connectivity_result, rgb_points_result, continuous_result, assist_result]):
         print("\n🎉 All tests passed! WebSocket client is ready for use!")
     else:
         print("\n⚠️  Some tests failed. Please check your ROS2 WebSocket server.")

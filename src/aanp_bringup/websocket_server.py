@@ -19,13 +19,18 @@ from scipy.spatial.transform import Rotation
 
 # ROS2 imports
 from sensor_msgs.msg import PointCloud2, Image
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
+import tf2_ros
+from tf2_ros import TransformException
+from rclpy.duration import Duration
 
 
 class AANPWebSocketServer:
     """WebSocket server class for AANP client communication"""
     
-    def __init__(self, host="0.0.0.0", port=8765, logger=None, max_points=10000, max_clients=10):
+    def __init__(self, host="0.0.0.0", port=8765, logger=None, max_points=10000, max_clients=10, 
+                 sampling_method="random", voxel_size=0.01, tf_buffer=None, target_frame="fr3_link0",
+                 workspace_bounds=None):
         """
         Initialize WebSocket server
         
@@ -35,12 +40,31 @@ class AANPWebSocketServer:
             logger: ROS2 logger object
             max_points: Maximum number of points to send (for performance)
             max_clients: Maximum number of concurrent clients
+            sampling_method: "random" for uniform random sampling, "voxel" for voxel grid sampling
+            voxel_size: Size of voxel grid for voxel sampling (in meters)
+            tf_buffer: TF2 buffer for coordinate transformations
+            target_frame: Target frame for point cloud transformation
+            workspace_bounds: Dict with keys 'x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max' for filtering
         """
         self.host = host
         self.port = port
         self.logger = logger or self._setup_default_logger()
         self.max_points = max_points
         self.max_clients = max_clients
+        self.sampling_method = sampling_method
+        self.voxel_size = voxel_size
+        self.tf_buffer = tf_buffer
+        self.target_frame = target_frame
+        
+        # Default workspace bounds (in target frame coordinates)
+        if workspace_bounds is None:
+            self.workspace_bounds = {
+                'x_min': -0.2, 'x_max': 0.8,
+                'y_min': -0.2, 'y_max': 0.6,
+                'z_min': -0.1, 'z_max': 0.8
+            }
+        else:
+            self.workspace_bounds = workspace_bounds
         
         # WebSocket server state
         self.server = None
@@ -52,6 +76,11 @@ class AANPWebSocketServer:
         # Data processing tools
         self.cv_bridge = CvBridge()
         
+        # TF transformation cache for performance
+        self.cached_transform = None
+        self.cached_transform_time = 0
+        self.transform_cache_duration = 5.0  # Cache transform for 5 seconds
+        
         # Current data cache
         self.current_eef_pose = np.eye(4)
         self.current_twist = np.zeros(6)
@@ -59,6 +88,11 @@ class AANPWebSocketServer:
         self.pointcloud_data = None
         self.image_data = None
         self.sensor_data_available = False
+        
+        # Store latest raw sensor messages for on-demand processing
+        self.latest_pointcloud_msg = None
+        self.latest_image_msg = None
+        self.raw_sensor_data_available = False
         
         # Callback functions
         self.assist_action_callback: Optional[Callable] = None
@@ -177,15 +211,18 @@ class AANPWebSocketServer:
             await self.send_error(websocket, f"Unknown message type: {message_type}")
     
     async def send_pointcloud_and_image(self, websocket):
-        """Send point cloud and image data"""
-        if not self.sensor_data_available:
+        """Send point cloud and image data - process on demand"""
+        if not self.raw_sensor_data_available:
             await self.send_error(websocket, "No sensor data available")
             return
         
         try:
-            # Check data validity
+            # Process sensor data on demand when client requests it
+            self.update_sensor_data(self.latest_pointcloud_msg, self.latest_image_msg)
+            
+            # Check data validity after processing
             if self.image_data is None or self.pointcloud_data is None:
-                await self.send_error(websocket, "Invalid sensor data")
+                await self.send_error(websocket, "Failed to process sensor data")
                 return
             
             # Encode data as base64
@@ -278,37 +315,203 @@ class AANPWebSocketServer:
         """Update gripper action"""
         self.current_gripper_action = action
     
+    def store_raw_sensor_data(self, pointcloud_msg: PointCloud2, image_msg: Image):
+        """Store raw sensor messages for on-demand processing"""
+        self.latest_pointcloud_msg = pointcloud_msg
+        self.latest_image_msg = image_msg
+        self.raw_sensor_data_available = True
+    
     def update_sensor_data(self, pointcloud_msg: PointCloud2, image_msg: Image):
         """Update sensor data (pointcloud and image)"""
         try:
             # Convert image
             self.image_data = self.cv_bridge.imgmsg_to_cv2(image_msg, "bgr8")
             
-            # Convert pointcloud with optimization for large data
-            points_list = []
-            point_count = 0
-            
+            # Step 1: Collect all valid points
+            all_points = []
             for point in pc2.read_points(pointcloud_msg, 
                                        field_names=("x", "y", "z"), 
                                        skip_nans=True):
-                if point_count >= self.max_points:
-                    break
-                points_list.append([point[0], point[1], point[2]])
-                point_count += 1
+                all_points.append([point[0], point[1], point[2]])
             
-            if len(points_list) > 0:
-                self.pointcloud_data = np.array(points_list, dtype=np.float32)
-                self.sensor_data_available = True
-                self.logger.info(f"Updated sensor data: RGB {self.image_data.shape}, Points {self.pointcloud_data.shape}")
+            if len(all_points) > 0:
+                all_points = np.array(all_points, dtype=np.float32)
+                self.logger.debug(f"Collected {len(all_points)} initial points")
                 
-                if point_count >= self.max_points:
-                    self.logger.info(f"Point cloud truncated to {self.max_points} points for performance")
+                # Step 2: Apply coordinate transformation first (if needed)
+                if self.tf_buffer is not None and self.target_frame != pointcloud_msg.header.frame_id:
+                    transformed_points = self._transform_point_cloud(all_points, pointcloud_msg.header, self.target_frame)
+                    if transformed_points is not None:
+                        all_points = transformed_points
+                        self.logger.debug(f"Point cloud transformed from {pointcloud_msg.header.frame_id} to {self.target_frame}")
+                
+                # Step 3: Apply workspace filtering early to reduce point count
+                workspace_filtered_points = self._filter_workspace_points(all_points)
+                if len(workspace_filtered_points) < len(all_points):
+                    self.logger.debug(f"Workspace filter: {len(all_points)} -> {len(workspace_filtered_points)} points")
+                
+                # Step 4: Apply downsampling strategy
+                if len(workspace_filtered_points) > self.max_points:
+                    if self.sampling_method == "random":
+                        # Strategy 1: Uniform random sampling
+                        indices = np.random.choice(len(workspace_filtered_points), self.max_points, replace=False)
+                        final_points = workspace_filtered_points[indices]
+                        self.logger.debug(f"Random sampling: {len(workspace_filtered_points)} -> {len(final_points)} points")
+                    elif self.sampling_method == "voxel":
+                        # Strategy 2: Voxel grid sampling
+                        final_points = self._voxel_grid_downsample(workspace_filtered_points, self.voxel_size)
+                        if len(final_points) > self.max_points:
+                            indices = np.random.choice(len(final_points), self.max_points, replace=False)
+                            final_points = final_points[indices]
+                        self.logger.debug(f"Voxel sampling: {len(workspace_filtered_points)} -> {len(final_points)} points")
+                    else:
+                        # Fallback to random sampling
+                        indices = np.random.choice(len(workspace_filtered_points), self.max_points, replace=False)
+                        final_points = workspace_filtered_points[indices]
+                        self.logger.debug(f"Fallback random sampling: {len(workspace_filtered_points)} -> {len(final_points)} points")
+                else:
+                    final_points = workspace_filtered_points
+                    self.logger.debug(f"No downsampling needed: {len(final_points)} points")
+                
+                self.pointcloud_data = final_points
+                self.sensor_data_available = True
+                self.logger.debug(f"Updated sensor data: RGB {self.image_data.shape}, Points {self.pointcloud_data.shape}")
             else:
                 self.logger.warn("No valid points in point cloud")
                 
         except Exception as e:
             self.logger.error(f"Error updating sensor data: {e}")
             self.sensor_data_available = False
+    
+    def _voxel_grid_downsample(self, points: np.ndarray, voxel_size: float) -> np.ndarray:
+        """
+        Downsample point cloud using voxel grid
+        
+        Args:
+            points: Input point cloud as numpy array of shape (N, 3)
+            voxel_size: Size of each voxel in meters
+            
+        Returns:
+            Downsampled point cloud as numpy array
+        """
+        try:
+            # Create voxel grid indices
+            voxel_indices = np.floor(points / voxel_size).astype(np.int32)
+            
+            # Create unique voxel identifiers
+            unique_voxels, inverse_indices = np.unique(voxel_indices, axis=0, return_inverse=True)
+            
+            # For each unique voxel, keep the centroid of all points in that voxel
+            downsampled_points = []
+            for i in range(len(unique_voxels)):
+                voxel_points = points[inverse_indices == i]
+                # Use centroid of points in this voxel
+                centroid = np.mean(voxel_points, axis=0)
+                downsampled_points.append(centroid)
+            
+            return np.array(downsampled_points, dtype=np.float32)
+            
+        except Exception as e:
+            self.logger.error(f"Error in voxel grid downsampling: {e}")
+            # Fallback to random sampling
+            if len(points) > self.max_points:
+                indices = np.random.choice(len(points), self.max_points, replace=False)
+                return points[indices]
+            return points
+    
+    def _transform_point_cloud(self, points: np.ndarray, header, target_frame: str) -> Optional[np.ndarray]:
+        """
+        Transform point cloud from source frame to target frame (with caching for performance)
+        
+        Args:
+            points: Input point cloud as numpy array of shape (N, 3)
+            header: Header from original PointCloud2 message
+            target_frame: Target frame for transformation
+            
+        Returns:
+            Transformed point cloud as numpy array, or None if transformation failed
+        """
+        try:
+            current_time = time.time()
+            
+            # Check if we can use cached transform (for static transforms)
+            if (self.cached_transform is not None and 
+                current_time - self.cached_transform_time < self.transform_cache_duration):
+                
+                translation = self.cached_transform['translation']
+                rotation_matrix = self.cached_transform['rotation_matrix']
+                self.logger.debug("Using cached transform for point cloud transformation")
+            else:
+                # Get fresh transformation from TF
+                transform = self.tf_buffer.lookup_transform(
+                    target_frame,
+                    header.frame_id,
+                    header.stamp,
+                    timeout=Duration(seconds=0.1)  # Reduced timeout for faster processing
+                )
+                
+                # Extract translation and rotation
+                translation = np.array([
+                    transform.transform.translation.x,
+                    transform.transform.translation.y,
+                    transform.transform.translation.z
+                ])
+                
+                quat = transform.transform.rotation
+                rotation = Rotation.from_quat([quat.x, quat.y, quat.z, quat.w])
+                rotation_matrix = rotation.as_matrix()
+                
+                # Cache the transform for future use
+                self.cached_transform = {
+                    'translation': translation,
+                    'rotation_matrix': rotation_matrix
+                }
+                self.cached_transform_time = current_time
+                self.logger.debug("Cached new transform for point cloud transformation")
+            
+            # Apply transformation to all points
+            # Use efficient matrix operations with broadcasting
+            transformed_points = (rotation_matrix @ points.T).T + translation
+            
+            return transformed_points.astype(np.float32)
+            
+        except (TransformException, tf2.LookupException, tf2.ConnectivityException, tf2.ExtrapolationException) as e:
+            self.logger.warn(f"Failed to transform point cloud from {header.frame_id} to {target_frame}: {e}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error in point cloud transformation: {e}")
+            return None
+    
+    def _filter_workspace_points(self, points: np.ndarray) -> np.ndarray:
+        """
+        Filter point cloud to keep only points within workspace bounds
+        
+        Args:
+            points: Input point cloud as numpy array of shape (N, 3)
+            
+        Returns:
+            Filtered point cloud as numpy array
+        """
+        try:
+            if len(points) == 0:
+                return points
+                
+            # Apply workspace bounds filtering
+            mask = (
+                (points[:, 0] >= self.workspace_bounds['x_min']) &
+                (points[:, 0] <= self.workspace_bounds['x_max']) &
+                (points[:, 1] >= self.workspace_bounds['y_min']) &
+                (points[:, 1] <= self.workspace_bounds['y_max']) &
+                (points[:, 2] >= self.workspace_bounds['z_min']) &
+                (points[:, 2] <= self.workspace_bounds['z_max'])
+            )
+            
+            filtered_points = points[mask]
+            return filtered_points
+            
+        except Exception as e:
+            self.logger.error(f"Error in workspace filtering: {e}")
+            return points
     
     def _pose_to_matrix(self, pose_stamped: PoseStamped) -> np.ndarray:
         """Convert PoseStamped to 4x4 transformation matrix"""
@@ -405,8 +608,8 @@ class AANPWebSocketServer:
         self.connected_clients -= disconnected_clients
         
         if disconnected_clients:
-            self.logger.info(f"Removed {len(disconnected_clients)} disconnected clients")
-    
+            self.logger.debug(f"Removed {len(disconnected_clients)} disconnected clients")
+
     # ==== Callback Function Settings ====
     
     def set_assist_action_callback(self, callback):

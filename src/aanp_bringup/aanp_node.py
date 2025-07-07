@@ -2,6 +2,7 @@ import rclpy
 import message_filters
 import tf2_ros
 import tf2_geometry_msgs
+import numpy as np
 
 from rclpy.node import Node
 from rclpy.action import ActionClient
@@ -11,11 +12,46 @@ from tf2_ros import LookupException, ConnectivityException, ExtrapolationExcepti
 from std_srvs.srv import Trigger
 from control_msgs.action import GripperCommand
 from joy_listener import JoyListener
+from websocket_server import AANPWebSocketServer
 
 
 class AANPMain(Node):
     def __init__(self):
         super().__init__('aanp_main_node')
+
+        # Initialize TF buffer and listener
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        # Initialize WebSocket server
+        self.websocket_server = AANPWebSocketServer(
+            host="0.0.0.0", 
+            port=8765, 
+            logger=self.get_logger(),
+            max_points=8000,  # Increase points but optimize processing
+            max_clients=2,
+            sampling_method="random",  # Use faster random sampling instead of voxel
+            voxel_size=0.01,  # Larger voxel size for faster processing
+            tf_buffer=self.tf_buffer,  # Pass TF buffer for coordinate transformations
+            target_frame="fr3_link0",  # Target frame for point cloud
+            workspace_bounds={  # Define robot workspace in fr3_link0 frame
+                'x_min': -0.2, 'x_max': 0.8,   # Front-back: from robot base forward
+                'y_min': -0.2, 'y_max': 0.6,   # Left-right: symmetric around robot
+                'z_min': -0.1, 'z_max': 0.8    # Up-down: above table, below ceiling
+            }
+        )
+        
+        # Set up assist action callback
+        self.websocket_server.set_assist_action_callback(self.handle_assist_action)
+        
+        # Start WebSocket server
+        self.websocket_server.start_server()
+        self.get_logger().info("WebSocket server started on port 8765")
+        
+        # Variables for assistance
+        self.assist_action = np.zeros(6)  # [x, y, z, roll, pitch, yaw]
+        self.assist_gripper_action = None
+        self.assist_action_received = False
 
         # sync pointcloud and image topics
         point_sub = message_filters.Subscriber(self, PointCloud2, '/camera/depth/color/points')
@@ -52,25 +88,41 @@ class AANPMain(Node):
         # 3. Publish twist commands at a regular interval
         self.twist_pub_timer = self.create_timer(0.1, self.twist_timer_callback)
         
+    def handle_assist_action(self, assist_action, gripper_action):
+        """Handle assistance action received from WebSocket client"""
+        self.assist_action = np.array(assist_action)
+        self.assist_gripper_action = gripper_action
+        self.assist_action_received = True
+        self.get_logger().debug(f"Received assist action: {assist_action}, gripper: {gripper_action}")
 
     def sensor_callback(self, pointcloud_msg, image_msg):
         if not self.got_frame:
             self.got_frame = True
             self.get_logger().info("Received first frame: PointCloud and Image. Starting AANP logic...")
-            # Send the latest pointcloud and image to the WebSocket server once
-            # ...
+            
         self.latest_pointcloud = pointcloud_msg
         self.latest_image = image_msg
+        
+        # Store raw sensor data for on-demand processing
+        self.websocket_server.store_raw_sensor_data(pointcloud_msg, image_msg)
+        self.get_logger().debug(f"Sensor callback triggered - stored raw sensor data for on-demand processing")
     
     def joy_callback(self, msg):
+        # Update joystick listener
         self.joy_listener.update_from_joy_msg(msg)
+        
         # Gripper control
+        gripper_action = None
         if msg.buttons[0]:  # A：close gripper
             self.send_gripper_command(0.0, 20.0)
+            gripper_action = -1  # Close
         elif msg.buttons[1]:  # B：open gripper
             self.send_gripper_command(0.039, 20.0)
-        # Send the gripper command to the WebSocket server
-        # ...
+            gripper_action = 1  # Open
+            
+        # Update gripper action in WebSocket server
+        if gripper_action is not None:
+            self.websocket_server.update_gripper_action(gripper_action)
 
     def twist_timer_callback(self):
         if not self.got_frame:
@@ -82,11 +134,14 @@ class AANPMain(Node):
             self.get_logger().warn("EEF pose not available, skipping twist command.")
             return
 
+        # Get human twist input once to ensure data consistency
+        current_twist = self.joy_listener.get_twist(self.get_clock().now().to_msg())
+
         # # Teleoperation Controller
-        vel_x, vel_y, vel_z, vel_roll, vel_pitch, vel_yaw = self.teleop_controller(eef_pose)
+        # vel_x, vel_y, vel_z, vel_roll, vel_pitch, vel_yaw = self.teleop_controller(eef_pose, current_twist)
 
         # Shared Controller
-        # vel_x, vel_y, vel_z, vel_roll, vel_pitch, vel_yaw = self.shared_controller(eef_pose)
+        vel_x, vel_y, vel_z, vel_roll, vel_pitch, vel_yaw = self.shared_controller(eef_pose, current_twist)
 
         # Send twist command
         twist = TwistStamped()
@@ -132,22 +187,56 @@ class AANPMain(Node):
             self.get_logger().warn(f"Can not get EEF pose: {e}")
             return None
 
-    def teleop_controller(self, eef_pose):
-        twist_msg = self.joy_listener.get_twist(self.get_clock().now().to_msg())
-        if twist_msg is None:
+    def teleop_controller(self, eef_pose, human_twist):
+        """Pure teleoperation controller"""
+        if human_twist is None:
             return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-        return twist_msg.twist.linear.x, twist_msg.twist.linear.y, twist_msg.twist.linear.z, \
-               twist_msg.twist.angular.x, twist_msg.twist.angular.y, twist_msg.twist.angular.z
+        return human_twist.twist.linear.x, human_twist.twist.linear.y, human_twist.twist.linear.z, \
+               human_twist.twist.angular.x, human_twist.twist.angular.y, human_twist.twist.angular.z
     
-    def shared_controller(self, eef_pose):
-        twist_msg = self.joy_listener.get_twist(self.get_clock().now().to_msg())
-        # Send the twist info to the WebSocket server
-        # ...
-
-        # Receive the assist action from the WebSocket server
-        # ...
-
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    def shared_controller(self, eef_pose, human_twist):
+        """Shared controller combining human input and AI assistance"""
+        # Initialize velocities
+        vel_x, vel_y, vel_z = 0.0, 0.0, 0.0
+        vel_roll, vel_pitch, vel_yaw = 0.0, 0.0, 0.0
+        
+        # Add human input
+        if human_twist is not None:
+            vel_x += human_twist.twist.linear.x
+            vel_y += human_twist.twist.linear.y
+            vel_z += human_twist.twist.linear.z
+            vel_roll += human_twist.twist.angular.x
+            vel_pitch += human_twist.twist.angular.y
+            vel_yaw += human_twist.twist.angular.z
+            
+        # Update WebSocket server with the same twist data being used
+        if self.websocket_server.get_connected_clients_count() > 0:
+            # Update EEF pose
+            self.websocket_server.update_eef_pose(eef_pose)
+            
+            # Update twist data with the same data we're using for control
+            linear = np.array([vel_x, vel_y, vel_z])
+            angular = np.array([vel_roll, vel_pitch, vel_yaw])
+            self.websocket_server.update_twist(linear, angular)
+            
+            # Publish all data to clients
+            self.websocket_server.publish_all_data()
+        
+        # When assistance action is received (self.assist_action_received will be updated in callback function), 
+        # apply the assistance
+        if self.assist_action_received:
+            self.get_logger().info(f"Applying assist action: {self.assist_action}")
+            assist_scale = 1.0  # Adjust this value as needed
+            vel_x += self.assist_action[0] * assist_scale
+            vel_y += self.assist_action[1] * assist_scale
+            vel_z += self.assist_action[2] * assist_scale
+            vel_roll += self.assist_action[3] * assist_scale
+            vel_pitch += self.assist_action[4] * assist_scale
+            vel_yaw += self.assist_action[5] * assist_scale
+            # Reset assistance flag
+            self.assist_action_received = False
+            
+        return vel_x, vel_y, vel_z, vel_roll, vel_pitch, vel_yaw
 
     def start_servo_service(self):
         if self.servo_start_client.service_is_ready():
@@ -167,13 +256,24 @@ class AANPMain(Node):
         goal_msg.command.max_effort = max_effort
         self.gripper_client.send_goal_async(goal_msg)
         self.get_logger().info(f"Gripper command sent: position={position}, effort={max_effort}")
+    
+    def destroy_node(self):
+        """Clean up WebSocket server when node is destroyed"""
+        self.get_logger().info("Shutting down WebSocket server...")
+        self.websocket_server.stop_server()
+        super().destroy_node()
 
 def main(args=None):
     rclpy.init(args=args)
     node = AANPMain()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("Keyboard interrupt received, shutting down...")
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
