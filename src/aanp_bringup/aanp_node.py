@@ -6,7 +6,7 @@ import numpy as np
 
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from sensor_msgs.msg import PointCloud2, Image, Joy
+from sensor_msgs.msg import Image, Joy, CameraInfo
 from geometry_msgs.msg import TwistStamped, PoseStamped
 from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 from std_srvs.srv import Trigger
@@ -28,17 +28,10 @@ class AANPMain(Node):
             host="0.0.0.0", 
             port=8765, 
             logger=self.get_logger(),
-            max_points=8000,  # Increase points but optimize processing
             max_clients=2,
-            sampling_method="random",  # Use faster random sampling instead of voxel
-            voxel_size=0.01,  # Larger voxel size for faster processing
             tf_buffer=self.tf_buffer,  # Pass TF buffer for coordinate transformations
             target_frame="fr3_link0",  # Target frame for point cloud
-            workspace_bounds={  # Define robot workspace in fr3_link0 frame
-                'x_min': -0.2, 'x_max': 0.8,   # Front-back: from robot base forward
-                'y_min': -0.2, 'y_max': 0.6,   # Left-right: symmetric around robot
-                'z_min': -0.1, 'z_max': 0.8    # Up-down: above table, below ceiling
-            }
+            camera_frame_id="camera_color_optical_frame"  # Use color optical frame for aligned depth
         )
         
         # Set up assist action callback
@@ -53,15 +46,16 @@ class AANPMain(Node):
         self.assist_gripper_action = None
         self.assist_action_received = False
 
-        # sync pointcloud and image topics
-        point_sub = message_filters.Subscriber(self, PointCloud2, '/camera/depth/color/points')
+        # sync depth and RGB image topics
+        # Use aligned depth for perfect pixel correspondence with RGB
+        depth_sub = message_filters.Subscriber(self, Image, '/camera/aligned_depth_to_color/image_raw')
         image_sub = message_filters.Subscriber(self, Image, '/camera/color/image_raw')
         ts = message_filters.ApproximateTimeSynchronizer(
-            [point_sub, image_sub], queue_size=10, slop=0.1
+            [depth_sub, image_sub], queue_size=10, slop=0.1
         )
         ts.registerCallback(self.sensor_callback)
         self.got_frame = False
-        self.latest_pointcloud = None
+        self.latest_depth = None
         self.latest_image = None
 
         ## Subscribers
@@ -73,6 +67,16 @@ class AANPMain(Node):
         # 2. Joy listener for joystick input
         self.joy_listener = JoyListener()
         self.joy_sub = self.create_subscription(Joy, '/joy', self.joy_callback, 10)
+
+        # 3. Subscribe to camera info to get accurate intrinsics
+        # Use aligned depth camera info for perfect correspondence with RGB
+        self.camera_info_sub = self.create_subscription(
+            CameraInfo, 
+            '/camera/aligned_depth_to_color/camera_info',  # Use aligned depth camera info
+            self.camera_info_callback, 
+            10
+        )
+        self.camera_info_received = False
 
         ## Publisher
         self.twist_pub = self.create_publisher(TwistStamped, '/servo_node/delta_twist_cmds', 10)
@@ -87,7 +91,7 @@ class AANPMain(Node):
 
         # 3. Publish twist commands at a regular interval
         self.twist_pub_timer = self.create_timer(0.1, self.twist_timer_callback)
-        
+
     def handle_assist_action(self, assist_action, gripper_action):
         """Handle assistance action received from WebSocket client"""
         self.assist_action = np.array(assist_action)
@@ -95,16 +99,16 @@ class AANPMain(Node):
         self.assist_action_received = True
         self.get_logger().debug(f"Received assist action: {assist_action}, gripper: {gripper_action}")
 
-    def sensor_callback(self, pointcloud_msg, image_msg):
+    def sensor_callback(self, depth_msg, image_msg):
         if not self.got_frame:
             self.got_frame = True
-            self.get_logger().info("Received first frame: PointCloud and Image. Starting AANP logic...")
+            self.get_logger().info("Received first frame: Depth and RGB Image. Starting AANP logic...")
             
-        self.latest_pointcloud = pointcloud_msg
+        self.latest_depth = depth_msg
         self.latest_image = image_msg
         
         # Store raw sensor data for on-demand processing
-        self.websocket_server.store_raw_sensor_data(pointcloud_msg, image_msg)
+        self.websocket_server.store_raw_sensor_data(depth_msg, image_msg)
         self.get_logger().debug(f"Sensor callback triggered - stored raw sensor data for on-demand processing")
     
     def joy_callback(self, msg):
@@ -257,6 +261,13 @@ class AANPMain(Node):
         self.gripper_client.send_goal_async(goal_msg)
         self.get_logger().info(f"Gripper command sent: position={position}, effort={max_effort}")
     
+    def camera_info_callback(self, msg):
+        """Update camera intrinsics from CameraInfo message"""
+        if not self.camera_info_received:
+            self.websocket_server.update_camera_intrinsics_from_camera_info(msg)
+            self.camera_info_received = True
+            self.get_logger().info("Updated camera intrinsics from camera_info topic")
+
     def destroy_node(self):
         """Clean up WebSocket server when node is destroyed"""
         self.get_logger().info("Shutting down WebSocket server...")

@@ -10,27 +10,27 @@ import json
 import threading
 import base64
 import numpy as np
-from typing import Set, Optional, Dict, Any, Callable
+from typing import Set, Optional, Dict, Any, Callable, Tuple
 import logging
 import time
 from cv_bridge import CvBridge
-import sensor_msgs_py.point_cloud2 as pc2
 from scipy.spatial.transform import Rotation
 
 # ROS2 imports
-from sensor_msgs.msg import PointCloud2, Image
+from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped, TransformStamped
 import tf2_ros
 from tf2_ros import TransformException
 from rclpy.duration import Duration
+import tf2_ros as tf2
 
 
 class AANPWebSocketServer:
     """WebSocket server class for AANP client communication"""
     
-    def __init__(self, host="0.0.0.0", port=8765, logger=None, max_points=10000, max_clients=10, 
-                 sampling_method="random", voxel_size=0.01, tf_buffer=None, target_frame="fr3_link0",
-                 workspace_bounds=None):
+    def __init__(self, host="0.0.0.0", port=8765, logger=None, max_clients=10, 
+                 tf_buffer=None, target_frame="fr3_link0", 
+                 camera_frame_id="camera_depth_optical_frame"):
         """
         Initialize WebSocket server
         
@@ -38,33 +38,22 @@ class AANPWebSocketServer:
             host: Server listening address
             port: Server port
             logger: ROS2 logger object
-            max_points: Maximum number of points to send (for performance)
             max_clients: Maximum number of concurrent clients
-            sampling_method: "random" for uniform random sampling, "voxel" for voxel grid sampling
-            voxel_size: Size of voxel grid for voxel sampling (in meters)
             tf_buffer: TF2 buffer for coordinate transformations
             target_frame: Target frame for point cloud transformation
-            workspace_bounds: Dict with keys 'x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max' for filtering
+            camera_frame_id: Frame ID for the camera depth frame
         """
         self.host = host
         self.port = port
         self.logger = logger or self._setup_default_logger()
-        self.max_points = max_points
         self.max_clients = max_clients
-        self.sampling_method = sampling_method
-        self.voxel_size = voxel_size
         self.tf_buffer = tf_buffer
         self.target_frame = target_frame
+        self.camera_frame_id = camera_frame_id
         
-        # Default workspace bounds (in target frame coordinates)
-        if workspace_bounds is None:
-            self.workspace_bounds = {
-                'x_min': -0.2, 'x_max': 0.8,
-                'y_min': -0.2, 'y_max': 0.6,
-                'z_min': -0.1, 'z_max': 0.8
-            }
-        else:
-            self.workspace_bounds = workspace_bounds
+        # Camera parameters for depth to point cloud conversion
+        # Initialize with defaults, will be updated from camera_info topic
+        self.setup_camera_parameters()
         
         # WebSocket server state
         self.server = None
@@ -90,13 +79,36 @@ class AANPWebSocketServer:
         self.sensor_data_available = False
         
         # Store latest raw sensor messages for on-demand processing
-        self.latest_pointcloud_msg = None
+        self.latest_depth_msg = None
         self.latest_image_msg = None
         self.raw_sensor_data_available = False
         
         # Callback functions
         self.assist_action_callback: Optional[Callable] = None
         
+    def setup_camera_parameters(self):
+        """Setup camera parameters for depth to point cloud conversion with defaults"""
+        # Default camera intrinsics (RealSense L515 typical values)
+        self.camera_intrinsics = np.array([
+            [602.9156, 0.0, 328.1451],
+            [0.0, 603.0374, 244.0271],
+            [0.0, 0.0, 1.0]
+        ], dtype=np.float32)
+        
+        # Default camera extrinsics (identity - no transformation)
+        # TF system handles coordinate transformations
+        self.camera_extrinsics = np.eye(4, dtype=np.float32)
+        
+        # Extract focal lengths and principal points for depth to point conversion
+        self.fx = self.camera_intrinsics[0, 0]
+        self.fy = self.camera_intrinsics[1, 1]
+        self.cx = self.camera_intrinsics[0, 2]
+        self.cy = self.camera_intrinsics[1, 2]
+        
+        self.logger.info(f"Initialized default camera parameters: fx={self.fx:.2f}, fy={self.fy:.2f}, cx={self.cx:.2f}, cy={self.cy:.2f}")
+        self.logger.debug(f"Camera intrinsics:\n{self.camera_intrinsics}")
+        self.logger.debug(f"Camera extrinsics:\n{self.camera_extrinsics}")
+    
     def _setup_default_logger(self):
         """Setup default logger"""
         logger = logging.getLogger("AANPWebSocketServer")
@@ -218,7 +230,7 @@ class AANPWebSocketServer:
         
         try:
             # Process sensor data on demand when client requests it
-            self.update_sensor_data(self.latest_pointcloud_msg, self.latest_image_msg)
+            self.update_sensor_data(self.latest_depth_msg, self.latest_image_msg)
             
             # Check data validity after processing
             if self.image_data is None or self.pointcloud_data is None:
@@ -315,124 +327,194 @@ class AANPWebSocketServer:
         """Update gripper action"""
         self.current_gripper_action = action
     
-    def store_raw_sensor_data(self, pointcloud_msg: PointCloud2, image_msg: Image):
+    def store_raw_sensor_data(self, depth_msg: Image, image_msg: Image):
         """Store raw sensor messages for on-demand processing"""
-        self.latest_pointcloud_msg = pointcloud_msg
+        self.latest_depth_msg = depth_msg
         self.latest_image_msg = image_msg
         self.raw_sensor_data_available = True
     
-    def update_sensor_data(self, pointcloud_msg: PointCloud2, image_msg: Image):
-        """Update sensor data (pointcloud and image)"""
+    def update_sensor_data(self, depth_msg: Image, image_msg: Image):
+        """Update sensor data (depth and RGB image) - generate ordered H×W×3 point cloud from depth"""
         try:
-            # Convert image
+            # Convert RGB image
             self.image_data = self.cv_bridge.imgmsg_to_cv2(image_msg, "bgr8")
+            image_height, image_width = self.image_data.shape[:2]
             
-            # Step 1: Collect all valid points
-            all_points = []
-            for point in pc2.read_points(pointcloud_msg, 
-                                       field_names=("x", "y", "z"), 
-                                       skip_nans=True):
-                all_points.append([point[0], point[1], point[2]])
+            # Convert depth image
+            depth_image = self.cv_bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
             
-            if len(all_points) > 0:
-                all_points = np.array(all_points, dtype=np.float32)
-                self.logger.debug(f"Collected {len(all_points)} initial points")
-                
-                # Step 2: Apply coordinate transformation first (if needed)
-                if self.tf_buffer is not None and self.target_frame != pointcloud_msg.header.frame_id:
-                    transformed_points = self._transform_point_cloud(all_points, pointcloud_msg.header, self.target_frame)
-                    if transformed_points is not None:
-                        all_points = transformed_points
-                        self.logger.debug(f"Point cloud transformed from {pointcloud_msg.header.frame_id} to {self.target_frame}")
-                
-                # Step 3: Apply workspace filtering early to reduce point count
-                workspace_filtered_points = self._filter_workspace_points(all_points)
-                if len(workspace_filtered_points) < len(all_points):
-                    self.logger.debug(f"Workspace filter: {len(all_points)} -> {len(workspace_filtered_points)} points")
-                
-                # Step 4: Apply downsampling strategy
-                if len(workspace_filtered_points) > self.max_points:
-                    if self.sampling_method == "random":
-                        # Strategy 1: Uniform random sampling
-                        indices = np.random.choice(len(workspace_filtered_points), self.max_points, replace=False)
-                        final_points = workspace_filtered_points[indices]
-                        self.logger.debug(f"Random sampling: {len(workspace_filtered_points)} -> {len(final_points)} points")
-                    elif self.sampling_method == "voxel":
-                        # Strategy 2: Voxel grid sampling
-                        final_points = self._voxel_grid_downsample(workspace_filtered_points, self.voxel_size)
-                        if len(final_points) > self.max_points:
-                            indices = np.random.choice(len(final_points), self.max_points, replace=False)
-                            final_points = final_points[indices]
-                        self.logger.debug(f"Voxel sampling: {len(workspace_filtered_points)} -> {len(final_points)} points")
-                    else:
-                        # Fallback to random sampling
-                        indices = np.random.choice(len(workspace_filtered_points), self.max_points, replace=False)
-                        final_points = workspace_filtered_points[indices]
-                        self.logger.debug(f"Fallback random sampling: {len(workspace_filtered_points)} -> {len(final_points)} points")
-                else:
-                    final_points = workspace_filtered_points
-                    self.logger.debug(f"No downsampling needed: {len(final_points)} points")
-                
-                self.pointcloud_data = final_points
+            # Log image information for debugging
+            self.logger.debug(f"RGB image: {self.image_data.shape}, dtype: {self.image_data.dtype}")
+            self.logger.debug(f"Depth image: {depth_image.shape}, dtype: {depth_image.dtype}")
+            self.logger.debug(f"Depth range: {np.min(depth_image)} - {np.max(depth_image)}")
+            
+            # Check if images are from the same timestamp (within tolerance)
+            time_diff = abs(depth_msg.header.stamp.sec + depth_msg.header.stamp.nanosec * 1e-9 - 
+                           image_msg.header.stamp.sec - image_msg.header.stamp.nanosec * 1e-9)
+            if time_diff > 0.1:  # 100ms tolerance
+                self.logger.warn(f"Large timestamp difference between depth and RGB: {time_diff:.3f}s")
+            
+            # Ensure depth image matches RGB image dimensions
+            if depth_image.shape[:2] != (image_height, image_width):
+                self.logger.warn(f"Depth and RGB image size mismatch: depth {depth_image.shape[:2]}, rgb {(image_height, image_width)}")
+                # Resize depth to match RGB if needed
+                import cv2
+                depth_image = cv2.resize(depth_image, (image_width, image_height), interpolation=cv2.INTER_NEAREST)
+                self.logger.info(f"Resized depth image to match RGB: {depth_image.shape}")
+            
+            # Generate ordered point cloud from depth image
+            self.pointcloud_data = self._depth_to_pointcloud(depth_image, depth_msg.header)
+            
+            if self.pointcloud_data is not None:
                 self.sensor_data_available = True
                 self.logger.debug(f"Updated sensor data: RGB {self.image_data.shape}, Points {self.pointcloud_data.shape}")
+                
+                # Additional validation: check if point cloud and image have same spatial dimensions
+                if self.pointcloud_data.shape[:2] != self.image_data.shape[:2]:
+                    self.logger.error(f"Point cloud and image spatial dimensions mismatch: "
+                                    f"points {self.pointcloud_data.shape[:2]}, image {self.image_data.shape[:2]}")
             else:
-                self.logger.warn("No valid points in point cloud")
+                self.logger.warn("Failed to generate point cloud from depth image")
+                self.sensor_data_available = False
                 
         except Exception as e:
             self.logger.error(f"Error updating sensor data: {e}")
             self.sensor_data_available = False
     
-    def _voxel_grid_downsample(self, points: np.ndarray, voxel_size: float) -> np.ndarray:
+    def _depth_to_pointcloud(self, depth_image: np.ndarray, header) -> Optional[np.ndarray]:
         """
-        Downsample point cloud using voxel grid
+        Convert depth image to ordered point cloud using camera intrinsics
         
         Args:
-            points: Input point cloud as numpy array of shape (N, 3)
-            voxel_size: Size of each voxel in meters
+            depth_image: Depth image as numpy array (H, W)
+            header: Header from depth image message for frame info
             
         Returns:
-            Downsampled point cloud as numpy array
+            Point cloud as numpy array of shape (H, W, 3) in camera coordinates or target frame
         """
         try:
-            # Create voxel grid indices
-            voxel_indices = np.floor(points / voxel_size).astype(np.int32)
+            # Check if camera intrinsics are valid (not just defaults)
+            # We assume valid intrinsics have been updated from camera_info topic
+            if self.camera_intrinsics is None or self.fx <= 0 or self.fy <= 0:
+                self.logger.warn("Invalid camera intrinsics - point cloud generation skipped")
+                return None
             
-            # Create unique voxel identifiers
-            unique_voxels, inverse_indices = np.unique(voxel_indices, axis=0, return_inverse=True)
+            height, width = depth_image.shape[:2]
             
-            # For each unique voxel, keep the centroid of all points in that voxel
-            downsampled_points = []
-            for i in range(len(unique_voxels)):
-                voxel_points = points[inverse_indices == i]
-                # Use centroid of points in this voxel
-                centroid = np.mean(voxel_points, axis=0)
-                downsampled_points.append(centroid)
+            # Create coordinate grids
+            u, v = np.meshgrid(np.arange(width), np.arange(height))
             
-            return np.array(downsampled_points, dtype=np.float32)
+            # Convert depth values to meters if needed (assuming depth is in millimeters)
+            # This depends on your camera configuration - adjust as needed
+            if depth_image.dtype == np.uint16:
+                # Common for RealSense: depth in millimeters, convert to meters
+                depth_m = depth_image.astype(np.float32) / 1000.0
+            else:
+                # Assume already in meters
+                depth_m = depth_image.astype(np.float32)
+            
+            # Create boolean mask for valid depth values
+            valid_mask = (depth_m > 0) & (depth_m < 10.0)  # Filter out invalid depths
+            
+            # Convert pixel coordinates to 3D points using camera intrinsics
+            # Camera coordinate system: X right, Y down, Z forward
+            x = (u - self.cx) * depth_m / self.fx
+            y = (v - self.cy) * depth_m / self.fy
+            z = depth_m
+            
+            # Stack coordinates to create point cloud
+            points = np.stack([x, y, z], axis=-1)  # Shape: (H, W, 3)
+            
+            # Set invalid points to NaN
+            points[~valid_mask] = np.nan
+            
+            # Debug: Log point cloud statistics in camera frame
+            valid_points_flat = points[valid_mask]
+            if len(valid_points_flat) > 0:
+                self.logger.debug(f"Generated {len(valid_points_flat)} valid points in camera frame")
+                sample_points = valid_points_flat[:5] if len(valid_points_flat) >= 5 else valid_points_flat
+                self.logger.debug(f"Sample points (camera frame): {sample_points}")
+            
+            # Apply camera extrinsics transformation if provided
+            if not np.allclose(self.camera_extrinsics, np.eye(4)):
+                points = self._apply_extrinsics_transformation(points)
+                self.logger.debug("Applied camera extrinsics transformation")
+            
+            # Transform to target frame if needed
+            if self.tf_buffer is not None and self.target_frame != self.camera_frame_id:
+                transformed_points = self._transform_point_cloud_structured(points, header, self.target_frame)
+                if transformed_points is not None:
+                    points = transformed_points
+                    self.logger.debug(f"Point cloud transformed from {self.camera_frame_id} to {self.target_frame}")
+                    
+                    # Debug: Log statistics after transformation
+                    valid_transformed = points[~np.isnan(points).any(axis=2)]
+                    if len(valid_transformed) > 0:
+                        mean_z = np.nanmean(valid_transformed[:, 2])
+                        self.logger.debug(f"Mean Z coordinate after transformation: {mean_z:.3f}m")
+                else:
+                    self.logger.warn(f"TF transformation failed, using points in {self.camera_frame_id}")
+            
+            return points.astype(np.float32)
             
         except Exception as e:
-            self.logger.error(f"Error in voxel grid downsampling: {e}")
-            # Fallback to random sampling
-            if len(points) > self.max_points:
-                indices = np.random.choice(len(points), self.max_points, replace=False)
-                return points[indices]
-            return points
+            self.logger.error(f"Error converting depth to point cloud: {e}")
+            return None
     
-    def _transform_point_cloud(self, points: np.ndarray, header, target_frame: str) -> Optional[np.ndarray]:
+    def _apply_extrinsics_transformation(self, points: np.ndarray) -> np.ndarray:
         """
-        Transform point cloud from source frame to target frame (with caching for performance)
+        Apply camera extrinsics transformation to point cloud
         
         Args:
-            points: Input point cloud as numpy array of shape (N, 3)
-            header: Header from original PointCloud2 message
+            points: Point cloud of shape (H, W, 3)
+            
+        Returns:
+            Transformed point cloud of shape (H, W, 3)
+        """
+        try:
+            original_shape = points.shape
+            H, W, _ = original_shape
+            
+            # Reshape to (H*W, 3) for transformation
+            points_flat = points.reshape(-1, 3)
+            
+            # Find valid points (not NaN)
+            valid_mask = ~np.isnan(points_flat).any(axis=1)
+            valid_points = points_flat[valid_mask]
+            
+            if len(valid_points) > 0:
+                # Convert to homogeneous coordinates
+                valid_points_hom = np.column_stack([valid_points, np.ones(len(valid_points))])
+                
+                # Apply extrinsics transformation
+                transformed_points_hom = (self.camera_extrinsics @ valid_points_hom.T).T
+                transformed_points = transformed_points_hom[:, :3]
+                
+                # Put transformed points back
+                points_flat[valid_mask] = transformed_points.astype(np.float32)
+            
+            # Reshape back to original format
+            return points_flat.reshape(original_shape)
+            
+        except Exception as e:
+            self.logger.error(f"Error applying extrinsics transformation: {e}")
+            return points
+    
+    def _transform_point_cloud_structured(self, points: np.ndarray, header, target_frame: str) -> Optional[np.ndarray]:
+        """
+        Transform structured point cloud (H×W×3) from source frame to target frame
+        
+        Args:
+            points: Input point cloud as numpy array of shape (H, W, 3)
+            header: Header from original message with frame_id and timestamp
             target_frame: Target frame for transformation
             
         Returns:
-            Transformed point cloud as numpy array, or None if transformation failed
+            Transformed point cloud as numpy array of shape (H, W, 3), or None if transformation failed
         """
         try:
             current_time = time.time()
+            source_frame = self.camera_frame_id  # Use camera frame ID instead of header frame_id
             
             # Check if we can use cached transform (for static transforms)
             if (self.cached_transform is not None and 
@@ -440,14 +522,14 @@ class AANPWebSocketServer:
                 
                 translation = self.cached_transform['translation']
                 rotation_matrix = self.cached_transform['rotation_matrix']
-                self.logger.debug("Using cached transform for point cloud transformation")
+                self.logger.debug("Using cached transform for structured point cloud transformation")
             else:
                 # Get fresh transformation from TF
                 transform = self.tf_buffer.lookup_transform(
                     target_frame,
-                    header.frame_id,
+                    source_frame,
                     header.stamp,
-                    timeout=Duration(seconds=0.1)  # Reduced timeout for faster processing
+                    timeout=Duration(seconds=0.1)
                 )
                 
                 # Extract translation and rotation
@@ -467,51 +549,37 @@ class AANPWebSocketServer:
                     'rotation_matrix': rotation_matrix
                 }
                 self.cached_transform_time = current_time
-                self.logger.debug("Cached new transform for point cloud transformation")
+                self.logger.debug("Cached new transform for structured point cloud transformation")
             
-            # Apply transformation to all points
-            # Use efficient matrix operations with broadcasting
-            transformed_points = (rotation_matrix @ points.T).T + translation
+            # Get original shape
+            original_shape = points.shape
+            H, W, _ = original_shape
             
-            return transformed_points.astype(np.float32)
+            # Reshape to (H*W, 3) for transformation, but keep track of valid points
+            points_flat = points.reshape(-1, 3)
+            
+            # Find valid points (not NaN)
+            valid_mask = ~np.isnan(points_flat).any(axis=1)
+            valid_points = points_flat[valid_mask]
+            
+            if len(valid_points) > 0:
+                # Apply transformation to valid points only
+                transformed_valid = (rotation_matrix @ valid_points.T).T + translation
+                
+                # Put transformed points back into the flat array
+                points_flat[valid_mask] = transformed_valid.astype(np.float32)
+            
+            # Reshape back to original H×W×3 format
+            transformed_points = points_flat.reshape(original_shape)
+            
+            return transformed_points
             
         except (TransformException, tf2.LookupException, tf2.ConnectivityException, tf2.ExtrapolationException) as e:
-            self.logger.warn(f"Failed to transform point cloud from {header.frame_id} to {target_frame}: {e}")
+            self.logger.warn(f"Failed to transform structured point cloud from {source_frame} to {target_frame}: {e}")
             return None
         except Exception as e:
-            self.logger.error(f"Error in point cloud transformation: {e}")
+            self.logger.error(f"Error in structured point cloud transformation: {e}")
             return None
-    
-    def _filter_workspace_points(self, points: np.ndarray) -> np.ndarray:
-        """
-        Filter point cloud to keep only points within workspace bounds
-        
-        Args:
-            points: Input point cloud as numpy array of shape (N, 3)
-            
-        Returns:
-            Filtered point cloud as numpy array
-        """
-        try:
-            if len(points) == 0:
-                return points
-                
-            # Apply workspace bounds filtering
-            mask = (
-                (points[:, 0] >= self.workspace_bounds['x_min']) &
-                (points[:, 0] <= self.workspace_bounds['x_max']) &
-                (points[:, 1] >= self.workspace_bounds['y_min']) &
-                (points[:, 1] <= self.workspace_bounds['y_max']) &
-                (points[:, 2] >= self.workspace_bounds['z_min']) &
-                (points[:, 2] <= self.workspace_bounds['z_max'])
-            )
-            
-            filtered_points = points[mask]
-            return filtered_points
-            
-        except Exception as e:
-            self.logger.error(f"Error in workspace filtering: {e}")
-            return points
     
     def _pose_to_matrix(self, pose_stamped: PoseStamped) -> np.ndarray:
         """Convert PoseStamped to 4x4 transformation matrix"""
@@ -640,6 +708,34 @@ class AANPWebSocketServer:
             "has_sensor_data": self.has_sensor_data(),
             "server_thread_alive": self.server_thread.is_alive() if self.server_thread else False
         }
+    
+    def update_camera_intrinsics_from_camera_info(self, camera_info_msg):
+        """
+        Update camera intrinsics from CameraInfo message
+        
+        Args:
+            camera_info_msg: sensor_msgs/CameraInfo message
+        """
+        try:
+            # Extract intrinsic matrix from CameraInfo
+            K = camera_info_msg.k  # 3x3 intrinsic matrix as flat array
+            self.camera_intrinsics = np.array([
+                [K[0], K[1], K[2]],
+                [K[3], K[4], K[5]], 
+                [K[6], K[7], K[8]]
+            ], dtype=np.float32)
+            
+            # Update focal lengths and principal points
+            self.fx = self.camera_intrinsics[0, 0]
+            self.fy = self.camera_intrinsics[1, 1]
+            self.cx = self.camera_intrinsics[0, 2]
+            self.cy = self.camera_intrinsics[1, 2]
+            
+            self.logger.info(f"Updated camera intrinsics from CameraInfo: fx={self.fx:.2f}, fy={self.fy:.2f}, cx={self.cx:.2f}, cy={self.cy:.2f}")
+            self.logger.info(f"Image size: {camera_info_msg.width}x{camera_info_msg.height}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to update camera intrinsics from CameraInfo: {e}")
 
 # Test and demo code
 if __name__ == "__main__":
