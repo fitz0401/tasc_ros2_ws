@@ -195,7 +195,7 @@ class AANPWebSocketServer:
                     data = json.loads(message)
                     await self.process_client_message(websocket, data)
                 except json.JSONDecodeError:
-                    self.logger.warn(f"Invalid JSON received from {client_addr}")
+                    self.logger.warn(f"Invalid JSON received from {client_addr}, received message: {message}")
                     await self.send_error(websocket, "Invalid JSON format")
                 except Exception as e:
                     self.logger.error(f"Error processing message from {client_addr}: {e}")
@@ -218,6 +218,8 @@ class AANPWebSocketServer:
             await self.handle_assist_action(data)
         elif message_type == "test":
             await self.send_test_response(websocket, data)
+        elif message_type == "heartbeat":
+            await self.handle_heartbeat(websocket, data)
         else:
             self.logger.warn(f"Unknown message type: {message_type}")
             await self.send_error(websocket, f"Unknown message type: {message_type}")
@@ -271,7 +273,7 @@ class AANPWebSocketServer:
                 self.logger.warn(f"Invalid assist action length: {len(assist_action)}, expected 6")
                 return
             
-            self.logger.info(f"Received assist action: {assist_action}, gripper: {gripper_action}")
+            self.logger.debug(f"Received assist action: {assist_action}, gripper: {gripper_action}")
             
             # Call callback function if available
             if self.assist_action_callback:
@@ -296,6 +298,22 @@ class AANPWebSocketServer:
         except Exception as e:
             self.logger.error(f"Error sending test response: {e}")
             await self.send_error(websocket, f"Failed to send test response: {str(e)}")
+    
+    async def handle_heartbeat(self, websocket, data):
+        """Handle heartbeat from client"""
+        try:
+            client_timestamp = data.get("timestamp", 0)
+            response = {
+                "type": "heartbeat_response",
+                "server_timestamp": self._get_timestamp(),
+                "client_timestamp": client_timestamp,
+                "message": "pong"
+            }
+            await websocket.send(json.dumps(response))
+            self.logger.debug(f"Responded to heartbeat from client")
+        except Exception as e:
+            self.logger.error(f"Error handling heartbeat: {e}")
+            # Don't send error response for heartbeat failures to avoid noise
     
     async def send_error(self, websocket, error_message):
         """Send error message"""

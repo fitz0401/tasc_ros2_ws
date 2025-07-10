@@ -116,17 +116,14 @@ class AANPMain(Node):
         self.joy_listener.update_from_joy_msg(msg)
         
         # Gripper control
-        gripper_action = None
+        gripper_action = 0
         if msg.buttons[0]:  # A：close gripper
             self.send_gripper_command(0.0, 20.0)
-            gripper_action = -1  # Close
+            gripper_action = 1  # Close
         elif msg.buttons[1]:  # B：open gripper
             self.send_gripper_command(0.039, 20.0)
-            gripper_action = 1  # Open
-            
-        # Update gripper action in WebSocket server
-        if gripper_action is not None:
-            self.websocket_server.update_gripper_action(gripper_action)
+            gripper_action = -1  # Open
+        self.websocket_server.update_gripper_action(gripper_action)
 
     def twist_timer_callback(self):
         if not self.got_frame:
@@ -225,12 +222,11 @@ class AANPMain(Node):
             
             # Publish all data to clients
             self.websocket_server.publish_all_data()
-        
         # When assistance action is received (self.assist_action_received will be updated in callback function), 
         # apply the assistance
         if self.assist_action_received:
-            self.get_logger().info(f"Applying assist action: {self.assist_action}")
-            assist_scale = 1.0  # Adjust this value as needed
+            self.get_logger().debug(f"Applying assist action: {self.assist_action}")
+            assist_scale = 2.0  # Adjust this value as needed
             vel_x += self.assist_action[0] * assist_scale
             vel_y += self.assist_action[1] * assist_scale
             vel_z += self.assist_action[2] * assist_scale
