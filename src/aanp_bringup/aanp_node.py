@@ -43,8 +43,11 @@ class AANPMain(Node):
         
         # Variables for assistance
         self.assist_action = np.zeros(6)  # [x, y, z, roll, pitch, yaw]
-        self.assist_gripper_action = None
         self.assist_action_received = False
+
+        # Gripper button state tracking to prevent multiple commands
+        self.gripper_button_a_pressed = False  # Track A button (close gripper)
+        self.gripper_button_b_pressed = False  # Track B button (open gripper)
 
         # sync depth and RGB image topics
         # Use aligned depth for perfect pixel correspondence with RGB
@@ -92,12 +95,11 @@ class AANPMain(Node):
         # 3. Publish twist commands at a regular interval
         self.twist_pub_timer = self.create_timer(0.1, self.twist_timer_callback)
 
-    def handle_assist_action(self, assist_action, gripper_action):
+    def handle_assist_action(self, assist_action):
         """Handle assistance action received from WebSocket client"""
         self.assist_action = np.array(assist_action)
-        self.assist_gripper_action = gripper_action
         self.assist_action_received = True
-        self.get_logger().debug(f"Received assist action: {assist_action}, gripper: {gripper_action}")
+        self.get_logger().debug(f"Received assist action: {assist_action}")
 
     def sensor_callback(self, depth_msg, image_msg):
         if not self.got_frame:
@@ -115,14 +117,27 @@ class AANPMain(Node):
         # Update joystick listener
         self.joy_listener.update_from_joy_msg(msg)
         
-        # Gripper control
+        # Gripper control - only send command on button press (not hold)
         gripper_action = 0
-        if msg.buttons[0]:  # A：close gripper
-            self.send_gripper_command(0.0, 20.0)
+        
+        # A button: close gripper
+        if msg.buttons[0]:  # A button pressed
             gripper_action = 1  # Close
-        elif msg.buttons[1]:  # B：open gripper
-            self.send_gripper_command(0.039, 20.0)
+            if not self.gripper_button_a_pressed:
+                self.send_gripper_command(0.0, 20.0)
+                self.gripper_button_a_pressed = True
+        else:
+            self.gripper_button_a_pressed = False  # Reset when button released
+
+        # B button: open gripper  
+        if msg.buttons[1]:  # B button pressed
             gripper_action = -1  # Open
+            if not self.gripper_button_b_pressed:
+                self.send_gripper_command(0.039, 20.0)
+                self.gripper_button_b_pressed = True
+        else:
+            self.gripper_button_b_pressed = False  # Reset when button released
+
         self.websocket_server.update_gripper_action(gripper_action)
 
     def twist_timer_callback(self):
@@ -226,7 +241,7 @@ class AANPMain(Node):
         # apply the assistance
         if self.assist_action_received:
             self.get_logger().debug(f"Applying assist action: {self.assist_action}")
-            assist_scale = 2.0  # Adjust this value as needed
+            assist_scale = 1.5  # Adjust this value as needed
             vel_x += self.assist_action[0] * assist_scale
             vel_y += self.assist_action[1] * assist_scale
             vel_z += self.assist_action[2] * assist_scale

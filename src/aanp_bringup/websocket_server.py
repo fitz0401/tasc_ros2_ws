@@ -266,18 +266,17 @@ class AANPWebSocketServer:
         """Handle assist action from client"""
         try:
             assist_action = np.array(data.get("assist_action", [0.0]*6), dtype=np.float64)
-            gripper_action = data.get("gripper_action")
             
             # Validate assist action data
             if len(assist_action) != 6:
                 self.logger.warn(f"Invalid assist action length: {len(assist_action)}, expected 6")
                 return
             
-            self.logger.debug(f"Received assist action: {assist_action}, gripper: {gripper_action}")
+            self.logger.debug(f"Received assist action: {assist_action}")
             
             # Call callback function if available
             if self.assist_action_callback:
-                self.assist_action_callback(assist_action, gripper_action)
+                self.assist_action_callback(assist_action)
             else:
                 self.logger.warn("No assist action callback registered")
                 
@@ -767,8 +766,8 @@ if __name__ == "__main__":
     server = AANPWebSocketServer(host="localhost", port=8765)
     
     # Mock assist action callback
-    def assist_action_callback(assist_action, gripper_action):
-        print(f"Received assist action: {assist_action}, gripper: {gripper_action}")
+    def assist_action_callback(assist_action):
+        print(f"Received assist action: {assist_action}")
     
     server.set_assist_action_callback(assist_action_callback)
     

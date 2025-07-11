@@ -54,15 +54,17 @@ class JoyListener:
         twist.header.frame_id = frame_id
 
         # Map axes to twist commands
-        twist.twist.linear.z = float(axes[RIGHT_STICK_Y])
-        twist.twist.linear.y = float(axes[RIGHT_STICK_X])
-        lin_x_right = -0.5 * (float(axes[RIGHT_TRIGGER]) - AXIS_DEFAULTS[RIGHT_TRIGGER])
-        lin_x_left = 0.5 * (float(axes[LEFT_TRIGGER]) - AXIS_DEFAULTS[LEFT_TRIGGER])
-        twist.twist.linear.x = lin_x_right + lin_x_left
+        twist.twist.linear.x = -float(axes[RIGHT_STICK_X])
+        twist.twist.linear.y = float(axes[RIGHT_STICK_Y])
+        lin_z_trigger = 0.4 * (float(axes[RIGHT_TRIGGER]) - AXIS_DEFAULTS[RIGHT_TRIGGER])   # Down
+        lin_z_bumper = 0.8 * float(buttons[RIGHT_BUMPER])   # Up
+        twist.twist.linear.z = lin_z_trigger + lin_z_bumper
         
+        twist.twist.angular.x = -float(axes[LEFT_STICK_X])
         twist.twist.angular.y = float(axes[LEFT_STICK_Y])
-        twist.twist.angular.x = float(axes[LEFT_STICK_X])
-        twist.twist.angular.z = float(buttons[RIGHT_BUMPER]) - float(buttons[LEFT_BUMPER])
+        ang_z_trigger = 0.4 * (float(axes[LEFT_TRIGGER]) - AXIS_DEFAULTS[LEFT_TRIGGER])
+        ang_z_bumper = 0.8 * float(buttons[LEFT_BUMPER])
+        twist.twist.angular.z = ang_z_trigger + ang_z_bumper
 
         return twist
 
