@@ -2,7 +2,7 @@
 """
 Minimal WebSocket Server for Basic Connectivity Testing
 This script is independent of ROS2 and can be run directly with Python.
-Used for testing WebSocket connectivity with AANP client before full ROS2 integration.
+Used for testing WebSocket connectivity with TASC client before full ROS2 integration.
 """
 
 import asyncio
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 class MinimalWebSocketServer:
     """
-    Minimal WebSocket server for testing connectivity with AANP client
+    Minimal WebSocket server for testing connectivity with TASC client
     """
     
     def __init__(self, host="0.0.0.0", port=8765):
@@ -283,7 +283,7 @@ def main():
     """Main function to run the server"""
     import argparse
     
-    parser = argparse.ArgumentParser(description="Minimal WebSocket Server for AANP Testing")
+    parser = argparse.ArgumentParser(description="Minimal WebSocket Server for TASC Testing")
     parser.add_argument("--host", default="0.0.0.0", help="Host address (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8765, help="Port number (default: 8765)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")

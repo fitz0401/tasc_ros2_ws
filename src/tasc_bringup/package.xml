@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>aanp_bringup</name>
+  <name>tasc_bringup</name>
   <version>0.0.0</version>
   <description>TODO: Package description</description>
   <maintainer email="u0177383@todo.todo">u0177383</maintainer>

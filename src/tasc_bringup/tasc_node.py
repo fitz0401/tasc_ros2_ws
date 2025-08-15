@@ -15,19 +15,19 @@ from franka_msgs.action import Grasp, Move
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 from joy_listener import JoyListener
-from websocket_server import AANPWebSocketServer
+from websocket_server import TASCWebSocketServer
 
 
-class AANPMain(Node):
+class TASCMain(Node):
     def __init__(self):
-        super().__init__('aanp_main_node')
+        super().__init__('tasc_main_node')
 
         # Initialize TF buffer and listener
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # Initialize WebSocket server
-        self.websocket_server = AANPWebSocketServer(
+        self.websocket_server = TASCWebSocketServer(
             host="0.0.0.0", 
             port=8765, 
             logger=self.get_logger(),
@@ -117,7 +117,7 @@ class AANPMain(Node):
     def sensor_callback(self, depth_msg, image_msg):
         if not self.got_frame:
             self.got_frame = True
-            self.get_logger().info("Received first frame: Depth and RGB Image. Starting AANP logic...")
+            self.get_logger().info("Received first frame: Depth and RGB Image. Starting TASC logic...")
             
         self.latest_depth = depth_msg
         self.latest_image = image_msg
@@ -481,7 +481,7 @@ class AANPMain(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = AANPMain()
+    node = TASCMain()
     
     try:
         rclpy.spin(node)

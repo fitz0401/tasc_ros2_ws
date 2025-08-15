@@ -2,13 +2,13 @@ from setuptools import setup, find_packages
 import os
 from glob import glob
 
-package_name = 'aanp_bringup'
+package_name = 'tasc_bringup'
 
 setup(
     name=package_name,
     version='0.0.0',
     packages=find_packages(),
-    py_modules=['aanp_node', 'joy_listener', 'websocket_server'],
+    py_modules=['tasc_node', 'joy_listener', 'websocket_server'],
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
@@ -40,12 +40,12 @@ setup(
     zip_safe=True,
     maintainer='u0177383',
     maintainer_email='u0177383@kuLeuven.be',
-    description='AANP Bringup Package with WebSocket Server',
+    description='TASC Bringup Package with WebSocket Server',
     license='Apache License 2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'aanp_node = aanp_node:main',
+            'tasc_node = tasc_node:main',
         ],
     },
 )

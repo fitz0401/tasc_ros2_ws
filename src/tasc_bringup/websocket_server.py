@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-WebSocket Server for AANP ROS2 Node
-Provides communication interface with external AANP client running in conda environment
+WebSocket Server for TASC ROS2 Node
+Provides communication interface with external TASC client running in conda environment
 """
 
 import asyncio
@@ -25,8 +25,8 @@ from rclpy.duration import Duration
 import tf2_ros as tf2
 
 
-class AANPWebSocketServer:
-    """WebSocket server class for AANP client communication"""
+class TASCWebSocketServer:
+    """WebSocket server class for TASC client communication"""
     
     def __init__(self, host="0.0.0.0", port=8765, logger=None, max_clients=10, 
                  tf_buffer=None, target_frame="fr3_link0", 
@@ -111,7 +111,7 @@ class AANPWebSocketServer:
     
     def _setup_default_logger(self):
         """Setup default logger"""
-        logger = logging.getLogger("AANPWebSocketServer")
+        logger = logging.getLogger("TASCWebSocketServer")
         logger.setLevel(logging.INFO)
         if not logger.handlers:
             handler = logging.StreamHandler()
@@ -288,7 +288,7 @@ class AANPWebSocketServer:
         try:
             response = {
                 "type": "test_response",
-                "message": "Hello from ROS2 AANP WebSocket Server",
+                "message": "Hello from ROS2 TASC WebSocket Server",
                 "received": data.get("message", ""),
                 "timestamp": self._get_timestamp()
             }
@@ -763,7 +763,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     
     # Create server instance
-    server = AANPWebSocketServer(host="localhost", port=8765)
+    server = TASCWebSocketServer(host="localhost", port=8765)
     
     # Mock assist action callback
     def assist_action_callback(assist_action):
